@@ -104,6 +104,7 @@ Option<uint32_t> Collection::to_doc(const std::string & json_str, nlohmann::json
         document = nlohmann::json::parse(json_str);
     } catch(const std::exception& e) {
         LOG(ERROR) << "JSON error: " << e.what();
+        LOG(ERROR) << "JSON body: " << json_str;
         return Option<uint32_t>(400, "Bad JSON.");
     }
 

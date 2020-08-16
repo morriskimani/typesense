@@ -10,11 +10,6 @@
 #include "raft_server.h"
 #include "logger.h"
 
-struct h2o_custom_req_handler_t {
-    h2o_handler_t super;
-    HttpServer* http_server;
-};
-
 HttpServer::HttpServer(const std::string & version, const std::string & listen_address,
                        uint32_t listen_port, const std::string & ssl_cert_path,
                        const std::string & ssl_cert_key_path, bool cors_enabled):
@@ -211,6 +206,9 @@ h2o_pathconf_t* HttpServer::register_handler(h2o_hostconf_t *hostconf, const cha
     handler->http_server = this;
     handler->super.on_req = on_req;
 
+    // Enable streaming request body
+    handler->super.supports_request_streaming = 1;
+
     compress_args.min_size = 256;       // don't gzip less than this size
     compress_args.brotli.quality = -1;  // disable, not widely supported
     compress_args.gzip.quality = 1;     // fastest
@@ -367,9 +365,8 @@ int HttpServer::catch_all_handler(h2o_handler_t *_self, h2o_req_t *req) {
         return send_response(req, 401, message);
     }
 
-    const std::string & req_body = std::string(req->entity.base, req->entity.len);
-
-    http_req* request = new http_req(req, http_method, route_hash, query_map, req_body);
+    const std::string & body = std::string(req->entity.base, req->entity.len);
+    http_req* request = new http_req(req, rpath->http_method, route_hash, query_map, body);
     http_res* response = new http_res();
 
     // routes match and is an authenticated request
@@ -379,28 +376,98 @@ int HttpServer::catch_all_handler(h2o_handler_t *_self, h2o_req_t *req) {
         request->metadata = StringUtils::randstring(AuthManager::KEY_LEN);
     }
 
-    // for writes, we defer to replication_state
-    if(http_method == "POST" || http_method == "PUT" || http_method == "DELETE") {
-        self->http_server->get_replication_state()->write(request, response);
-        return 0;
-    }
+    if(req->proceed_req == nullptr) {
+        // Full request body is already available, so we don't care if handler is async or not
+        return process_request(request, response, rpath, self);
+    } else {
+        // Only partial request body is available.
+        // If async_req is true, the request handler function will be invoked multiple times, for each chunk
+        request->streaming = rpath->async_req;
+        async_req_ctx_t* async_req_ctx = new async_req_ctx_t(request, response, self, rpath);
 
-    (rpath->handler)(*request, *response);
+        LOG(INFO) << "Partial request body length: " << req->entity.len;
 
-    if(!rpath->async_res) {
-        // If a handler is marked as async res, it's responsible for sending the response itself in an async fashion
-        // otherwise, we send the response on behalf of the handler
-        self->http_server->send_response(request, response);
+        req->write_req.cb = async_req_cb;
+        req->write_req.ctx = async_req_ctx;
+        int is_end_entity = 0;
+        req->proceed_req(req, req->entity.len, is_end_entity);
     }
 
     return 0;
 }
 
-void HttpServer::send_message(const std::string & type, void* data) {
-    message_dispatcher->send_message(type, data);
+int HttpServer::async_req_cb(void *ctx, h2o_iovec_t chunk, int is_end_stream) {
+    async_req_ctx_t* req_ctx = static_cast<async_req_ctx_t*>(ctx);
+
+    http_req* request = req_ctx->request;
+    http_res* response = req_ctx->response;
+
+    LOG(INFO) << "chunk.len: " << chunk.len << ", is_end_stream: " << is_end_stream;
+
+    request->chunk_length = chunk.len;
+
+    std::string chunk_str(chunk.base, chunk.len);
+    request->body += chunk_str;
+
+    if(request->streaming || is_end_stream) {
+        // Handler should be invoked for every chunk for streaming requests
+        // For a non streaming request, buffer body and invoke only at the end
+
+        // default value for response is NON_STREAMING
+        // for streaming requests, we have to set: START, IN_PROGRESS or END
+        if(request->streaming) {
+            if(is_end_stream) {
+                request->stream_state = "END";
+            } else if(request->stream_state == "NON_STREAMING") {
+                // `NON_STREAMING` default value indicates first chunk of streaming body
+                request->stream_state = "START";
+            } else {
+                request->stream_state = "IN_PROGRESS";
+            }
+        }
+
+        process_request(request, response, req_ctx->rpath, req_ctx->handler);
+    }
+
+    if(!is_end_stream && !request->streaming) {
+        // streaming requests will call proceed_req in an async fashion
+        // so we have to handle this only for non streaming
+        size_t written = chunk.len;
+        int stream_ended = 0;
+        request->_req->proceed_req(request->_req, written, stream_ended);
+    }
+
+    if (is_end_stream) {
+        // deletes only the container -- individual requests and response are deleted by response handler
+        delete req_ctx;
+    }
+
+    return 0;
 }
 
-void HttpServer::send_response(http_req* request, const http_res* response) {
+int HttpServer::process_request(http_req* request, http_res* response, route_path *rpath,
+                                const h2o_custom_req_handler_t *handler) {
+
+    // for writes, we delegate to replication_state to handle response
+    if(rpath->http_method == "POST" || rpath->http_method == "PUT" || rpath->http_method == "DELETE") {
+        handler->http_server->get_replication_state()->write(request, response);
+        return 0;
+    }
+
+    // for reads, we will invoke the request handler and handle response as well
+
+    (rpath->handler)(*request, *response);
+
+    if(!rpath->async_res) {
+        // If a handler is marked as async res, it's responsible for sending the response itself in an async fashion
+        // otherwise, we send the whole body response on behalf of the handler
+        handler->http_server->send_response(request, response);
+    }
+
+    return 0;
+}
+
+void HttpServer::send_response(http_req* request, http_res* response) {
     h2o_req_t* req = request->_req;
     h2o_generator_t generator = {NULL, NULL};
 
@@ -427,36 +494,40 @@ int HttpServer::send_response(h2o_req_t *req, int status_code, const std::string
     return 0;
 }
 
+void HttpServer::send_message(const std::string & type, void* data) {
+    message_dispatcher->send_message(type, data);
+}
+
 void HttpServer::set_auth_handler(bool (*handler)(std::map<std::string, std::string>& params, const route_path& rpath,
                                                   const std::string& auth_key)) {
     auth_handler = handler;
 }
 
-void HttpServer::get(const std::string & path, bool (*handler)(http_req &, http_res &), bool async) {
+void HttpServer::get(const std::string & path, bool (*handler)(http_req &, http_res &), bool async_req, bool async_res) {
     std::vector<std::string> path_parts;
     StringUtils::split(path, path_parts, "/");
-    route_path rpath("GET", path_parts, handler, async);
+    route_path rpath("GET", path_parts, handler, async_req, async_res);
     routes.emplace_back(rpath.route_hash(), rpath);
 }
 
-void HttpServer::post(const std::string & path, bool (*handler)(http_req &, http_res &), bool async) {
+void HttpServer::post(const std::string & path, bool (*handler)(http_req &, http_res &), bool async_req, bool async_res) {
     std::vector<std::string> path_parts;
     StringUtils::split(path, path_parts, "/");
-    route_path rpath("POST", path_parts, handler, async);
+    route_path rpath("POST", path_parts, handler, async_req, async_res);
     routes.emplace_back(rpath.route_hash(), rpath);
 }
 
-void HttpServer::put(const std::string & path, bool (*handler)(http_req &, http_res &), bool async) {
+void HttpServer::put(const std::string & path, bool (*handler)(http_req &, http_res &), bool async_req, bool async_res) {
     std::vector<std::string> path_parts;
     StringUtils::split(path, path_parts, "/");
-    route_path rpath("PUT", path_parts, handler, async);
+    route_path rpath("PUT", path_parts, handler, async_req, async_res);
     routes.emplace_back(rpath.route_hash(), rpath);
 }
 
-void HttpServer::del(const std::string & path, bool (*handler)(http_req &, http_res &), bool async) {
+void HttpServer::del(const std::string & path, bool (*handler)(http_req &, http_res &), bool async_req, bool async_res) {
     std::vector<std::string> path_parts;
     StringUtils::split(path, path_parts, "/");
-    route_path rpath("DELETE", path_parts, handler, async);
+    route_path rpath("DELETE", path_parts, handler, async_req, async_res);
     routes.emplace_back(rpath.route_hash(), rpath);
 }
 
